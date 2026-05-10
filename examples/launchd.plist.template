@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  magpie launchd template.
+
+  Setup (replace YOURUSERNAME with your macOS short user name):
+
+    cp examples/launchd.plist.template ~/Library/LaunchAgents/com.YOURUSERNAME.tx-archive.plist
+    sed -i '' "s|YOURUSERNAME|$(whoami)|g" ~/Library/LaunchAgents/com.YOURUSERNAME.tx-archive.plist
+    launchctl load ~/Library/LaunchAgents/com.YOURUSERNAME.tx-archive.plist
+
+  Verify:
+    launchctl list | grep tx-archive
+    launchctl print "gui/$(id -u)/com.YOURUSERNAME.tx-archive" | grep "next fire"
+
+  Disable / remove:
+    launchctl unload ~/Library/LaunchAgents/com.YOURUSERNAME.tx-archive.plist
+    rm ~/Library/LaunchAgents/com.YOURUSERNAME.tx-archive.plist
+
+  Adjust the Hour key below to change the run time (24-hour clock).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.YOURUSERNAME.tx-archive</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/tx</string>
+        <string>archive</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOURUSERNAME/.tx/archive.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/YOURUSERNAME/.tx/archive.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/YOURUSERNAME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/YOURUSERNAME</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/YOURUSERNAME</string>
+</dict>
+</plist>

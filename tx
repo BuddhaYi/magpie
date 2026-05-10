@@ -1,0 +1,626 @@
+#!/usr/bin/env python3
+"""tx — unified router for bird (X GraphQL) + opencli (browser automation).
+
+Routing rules (after stripping global flags):
+  1. internal cmd (auth/archive/doctor/help/--refresh/--version)  → handled here
+  2. tx bird <args...>          → exec bird
+  3. tx <site> <args...>        → exec opencli <site>     (site = opencli site or app adapter)
+  4. tx --via bird <cmd>        → exec bird
+  5. tx --via opencli <cmd>     → exec opencli twitter
+  6. cmd in BOTH bird & opencli → bird wins (faster)
+  7. cmd in only one            → that one
+  8. unknown                    → suggest similar, exit 2
+
+Global flags (must come BEFORE the subcommand):
+  --refresh             rebuild discovery cache
+  --version             print version
+  --via <bird|opencli>  force backend
+  --help / -h           show this help
+  --                    end of tx flags (rest is passthrough)
+
+Cache: ~/.tx/cache.json (rebuilt every 7d or via --refresh).
+"""
+import difflib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+VERSION = "0.1.0"
+CACHE_DIR = Path.home() / ".tx"
+CACHE_FILE = CACHE_DIR / "cache.json"
+CACHE_TTL = 7 * 24 * 3600  # 7 days
+
+INTERNAL_CMDS = {"auth", "archive", "cookies-save", "doctor", "help"}
+COOKIES_FILE = CACHE_DIR / "cookies.env"
+NPM_GLOBAL_LIB = Path.home() / ".npm-global" / "lib" / "node_modules"
+
+# ---------- Discovery ----------
+
+def _run(args):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=15)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+
+def parse_bird_cmds():
+    if not shutil.which("bird"):
+        return set()
+    res = _run(["bird", "--help"])
+    if not res or res.returncode != 0:
+        return set()
+    cmds = set()
+    in_section = False
+    for line in res.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Commands:"):
+            in_section = True
+            continue
+        if in_section and (stripped.startswith("Examples") or stripped == ""):
+            if stripped.startswith("Examples"):
+                break
+            continue
+        if in_section:
+            m = re.match(r"\s+([a-z][\w|-]*)", line)
+            if m:
+                for n in m.group(1).split("|"):
+                    cmds.add(n)
+    return cmds
+
+
+def parse_opencli_twitter():
+    if not shutil.which("opencli"):
+        return {}
+    res = _run(["opencli", "twitter", "--help"])
+    if not res or res.returncode != 0:
+        return {}
+    cmds = {}
+    for line in res.stdout.splitlines():
+        m = re.match(r"\s+([a-z][\w-]*)\s.*\[(read|write)\]", line)
+        if m:
+            cmds[m.group(1)] = m.group(2)
+    return cmds
+
+
+def parse_opencli_adapters():
+    """Return set of adapter names from `opencli list`.
+
+    Format: each adapter is a 2-space-indented bare identifier on its own line,
+    followed by 4-space-indented sub-command lines. Example:
+        2-space indent ▸ 1688
+        4-space indent ▸     assets [cookie] — ...
+    """
+    if not shutil.which("opencli"):
+        return set()
+    res = _run(["opencli", "list"])
+    if not res or res.returncode != 0:
+        return set()
+    names = set()
+    for line in res.stdout.splitlines():
+        # exactly 2 leading spaces, then a bare identifier, nothing else
+        m = re.match(r"^  ([a-z][\w-]*)\s*$", line)
+        if m:
+            names.add(m.group(1))
+    return names
+
+
+def build_cache():
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    data = {
+        "version": 1,
+        "built_at": time.time(),
+        "bird": sorted(parse_bird_cmds()),
+        "opencli_twitter": parse_opencli_twitter(),
+        "opencli_sites": sorted(parse_opencli_adapters()),
+    }
+    # atomic write
+    fd, tmp = tempfile.mkstemp(dir=str(CACHE_DIR), prefix=".cache.", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, CACHE_FILE)
+    except Exception:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+    return data
+
+
+def load_cache(force_refresh=False):
+    if force_refresh:
+        return build_cache()
+    if not CACHE_FILE.exists():
+        return build_cache()
+    if time.time() - CACHE_FILE.stat().st_mtime > CACHE_TTL:
+        return build_cache()
+    try:
+        return json.loads(CACHE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return build_cache()
+
+
+# ---------- Internal commands ----------
+
+def cmd_help(rest, cache):
+    if rest:
+        # tx help <subcommand> → forward to backing tool's --help
+        sub = rest[0]
+        sites = set(cache["opencli_sites"])
+        bird = set(cache["bird"])
+        oc = cache["opencli_twitter"]
+        if sub == "bird":
+            os.execvp("bird", ["bird", "--help"])
+        if sub in sites:
+            os.execvp("opencli", ["opencli", sub, "--help"])
+        if sub in bird:
+            os.execvp("bird", ["bird", sub, "--help"])
+        if sub in oc:
+            os.execvp("opencli", ["opencli", "twitter", sub, "--help"])
+        print(f"unknown command: {sub}", file=sys.stderr)
+        return 2
+    # categorized listing
+    bird = sorted(cache["bird"])
+    oc = cache["opencli_twitter"]
+    sites = sorted(cache["opencli_sites"])
+    overlap = [c for c in bird if c in oc]
+    only_bird = [c for c in bird if c not in oc]
+    only_oc = sorted(c for c in oc if c not in cache["bird"])
+
+    print(f"tx {VERSION}  —  unified bird + opencli router")
+    print()
+    print("USAGE")
+    print("  tx [global-flags] <command> [args...]")
+    print()
+    print("GLOBAL FLAGS  (must precede the subcommand)")
+    print("  --refresh                rebuild discovery cache")
+    print("  --version                print version")
+    print("  --via <bird|opencli>     force backend (e.g. --via opencli search 'x')")
+    print("  --help, -h               this help")
+    print()
+    print("INTERNAL")
+    print("  tx auth                  check bird + opencli auth status")
+    print("  tx archive               sync X bookmarks → ~/.tx/bookmarks.db")
+    print("  tx cookies-save [--from edge|chrome|safari|firefox|edge-stable]")
+    print("                           extract X cookies → ~/.tx/cookies.env (default: edge)")
+    print("  tx cookies-save --check-age")
+    print("                           show cookie age + status (no extraction)")
+    print("  tx doctor                diagnose installation")
+    print("  tx help <cmd>            forward to backing tool's --help")
+    print()
+    print(f"X COMMANDS — auto-routed  ({len(only_bird)} bird-only, {len(only_oc)} opencli-only, {len(overlap)} overlap → bird)")
+    print("  bird-only :", " ".join(only_bird))
+    print("  opencli-only :", " ".join(only_oc))
+    print("  overlap (→ bird) :", " ".join(overlap))
+    print()
+    print(f"SITE / APP ADAPTERS  ({len(sites)})  — usage: tx <name> <verb> [args...]")
+    cols = 6
+    for i in range(0, len(sites), cols):
+        print(" ", "  ".join(f"{s:14s}" for s in sites[i:i + cols]))
+    print()
+    print("ESCAPES")
+    print("  tx bird <args>           force bird")
+    print("  tx <site> <args>         force opencli <site> (incl. tx twitter)")
+    return 0
+
+
+def cmd_auth(rest, cache):
+    print("=== tx auth check ===")
+    print()
+    print("[bird]")
+    if shutil.which("bird"):
+        r = _run(["bird", "check"])
+        if r and r.returncode == 0:
+            for line in r.stdout.splitlines():
+                print(" ", line)
+        else:
+            print("  ❌ bird check failed")
+            if r: print(" ", (r.stderr or r.stdout).strip())
+    else:
+        print("  ❌ bird not installed   →   npm i -g @steipete/bird")
+    print()
+    print("[opencli]")
+    if shutil.which("opencli"):
+        r = _run(["opencli", "doctor"])
+        if r:
+            for line in r.stdout.splitlines():
+                print(" ", line)
+        else:
+            print("  ❌ opencli doctor failed")
+    else:
+        print("  ❌ opencli not installed   →   npm i -g @jackwener/opencli")
+    print()
+    print("[saved cookies]")
+    age, source, label = _cookies_status()
+    if age is None:
+        print(f"  ⚠️  no ~/.tx/cookies.env — launchd/cron will fail. run: tx cookies-save")
+    else:
+        days = age / 86400
+        icon = {"fresh": "✅", "aging": "🟡", "stale (renew soon)": "🟠",
+                "expired (renew NOW)": "🔴"}.get(label, "❓")
+        print(f"  {icon} source: {source}, age: {days:.1f}d, status: {label}")
+        if "stale" in label or "expired" in label:
+            print(f"     → re-run: tx cookies-save")
+    return 0
+
+
+def cmd_doctor(rest, cache):
+    print(f"tx {VERSION}")
+    print(f"  bird:      {shutil.which('bird') or 'NOT FOUND'}")
+    print(f"  opencli:   {shutil.which('opencli') or 'NOT FOUND'}")
+    print(f"  cache:     {CACHE_FILE}  ({'exists' if CACHE_FILE.exists() else 'missing'})")
+    if CACHE_FILE.exists():
+        age = time.time() - CACHE_FILE.stat().st_mtime
+        print(f"  age:       {age / 3600:.1f} h  (TTL {CACHE_TTL / 3600:.0f} h)")
+    print(f"  bird cmds: {len(cache['bird'])}")
+    print(f"  opencli twitter cmds: {len(cache['opencli_twitter'])}")
+    print(f"  opencli adapters: {len(cache['opencli_sites'])}")
+    return 0
+
+
+def _load_cookies_env():
+    """Read AUTH_TOKEN/CT0 from ~/.tx/cookies.env into the current env (for subprocesses)."""
+    if not COOKIES_FILE.exists():
+        return
+    try:
+        for line in COOKIES_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            os.environ.setdefault(k.strip(), v.strip())
+    except OSError:
+        pass
+
+
+def _cookies_status():
+    """Return (age_seconds, source, status_label) for ~/.tx/cookies.env, or (None,)*3."""
+    if not COOKIES_FILE.exists():
+        return None, None, "missing"
+    try:
+        age = time.time() - COOKIES_FILE.stat().st_mtime
+        first_line = COOKIES_FILE.read_text().splitlines()[0]
+        # parse "# tx cookies — extracted from <SOURCE> at ..."
+        m = re.search(r"extracted from (\S+(?:\s+\S+)?)\s+at", first_line)
+        source = m.group(1) if m else "unknown"
+    except (OSError, IndexError):
+        return None, None, "unreadable"
+    days = age / 86400
+    if days < 30:    label = "fresh"
+    elif days < 60:  label = "aging"
+    elif days < 90:  label = "stale (renew soon)"
+    else:            label = "expired (renew NOW)"
+    return age, source, label
+
+
+def _is_auth_error(stderr_text):
+    """Heuristic: bird auth failure → suggests cookies need renewal."""
+    if not stderr_text:
+        return False
+    s = stderr_text.lower()
+    return any(k in s for k in (
+        "401", "could not authenticate", "missing required credentials",
+        "no twitter cookies", "missing auth_token", "missing ct0",
+    ))
+
+
+SWEET_COOKIE_DIR = (
+    NPM_GLOBAL_LIB / "@steipete" / "bird" / "node_modules" / "@steipete" / "sweet-cookie"
+)
+EDGE_PROFILE_DIR = (
+    Path.home() / "Library" / "Application Support" / "Microsoft Edge Beta" / "Default"
+)
+EDGE_STABLE_PROFILE_DIR = (
+    Path.home() / "Library" / "Application Support" / "Microsoft Edge" / "Default"
+)
+
+
+def _extract_cookies_via_provider(provider_path, opts_json):
+    """Run a sweet-cookie provider (edge / chrome / safari / firefox) directly.
+
+    Returns (auth_token, ct0, source) tuple or raises RuntimeError.
+    """
+    js = (
+        f"const p = require('./dist/providers/{provider_path}');"
+        f"const fn = Object.values(p)[0];"  # each provider exports one fn
+        f"fn({opts_json}, ['https://x.com','https://twitter.com'], null).then(r => {{"
+        "  const cs = r.cookies || [];"
+        "  const auth = cs.find(c => c.name === 'auth_token');"
+        "  const ct0  = cs.find(c => c.name === 'ct0');"
+        "  if (!auth || !ct0) {"
+        "    console.error('no auth_token/ct0 — make sure x.com is logged in');"
+        "    if (r.warnings && r.warnings.length) console.error(r.warnings.join('\\n'));"
+        "    process.exit(1);"
+        "  }"
+        "  console.log(auth.value);"
+        "  console.log(ct0.value);"
+        "}).catch(e => { console.error(e.message); process.exit(1); });"
+    )
+    res = subprocess.run(
+        ["node", "-e", js],
+        cwd=str(SWEET_COOKIE_DIR),
+        capture_output=True, text=True, timeout=45,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(res.stderr.strip() or "extraction failed")
+    lines = res.stdout.strip().splitlines()
+    if len(lines) < 2:
+        raise RuntimeError(f"unexpected output: {res.stdout!r}")
+    return lines[0], lines[1]
+
+
+def cmd_cookies_save(rest, cache):
+    """Extract X cookies and persist to ~/.tx/cookies.env (mode 0600).
+
+    Default: Edge Beta (most persistent on macOS — no Safari ITP, no annual rotation).
+    Override: tx cookies-save --from <edge|edge-stable|chrome|safari|firefox>
+    """
+    # --check-age: print status and exit, no extraction
+    if "--check-age" in rest:
+        age, source, label = _cookies_status()
+        if age is None:
+            print("no cookies file — run `tx cookies-save` to create one")
+            return 1
+        days = age / 86400
+        print(f"source: {source}")
+        print(f"age:    {days:.1f} days")
+        print(f"status: {label}")
+        return 0 if "stale" not in label and "expired" not in label else 2
+
+    browser = "edge"
+    if "--from" in rest:
+        i = rest.index("--from")
+        if i + 1 >= len(rest):
+            print("tx cookies-save: --from requires a value", file=sys.stderr)
+            return 2
+        browser = rest[i + 1]
+
+    if not SWEET_COOKIE_DIR.exists():
+        print(f"sweet-cookie not found at {SWEET_COOKIE_DIR}", file=sys.stderr)
+        return 1
+
+    common_opts = {"timeoutMs": 30000}
+    if browser == "edge":
+        if not EDGE_PROFILE_DIR.exists():
+            print(f"Edge Beta profile not found: {EDGE_PROFILE_DIR}", file=sys.stderr)
+            return 1
+        opts = {**common_opts, "profile": str(EDGE_PROFILE_DIR)}
+        provider = "edge.js"
+        source = "Edge Beta"
+    elif browser == "edge-stable":
+        opts = {**common_opts, "profile": str(EDGE_STABLE_PROFILE_DIR)}
+        provider = "edge.js"
+        source = "Edge"
+    elif browser == "chrome":
+        opts = common_opts
+        provider = "chrome.js"
+        source = "Chrome"
+    elif browser == "safari":
+        opts = common_opts
+        provider = "safariBinaryCookies.js"
+        source = "Safari"
+    elif browser == "firefox":
+        opts = common_opts
+        provider = "firefoxSqlite.js"
+        source = "Firefox"
+    else:
+        print(f"tx cookies-save: unknown browser '{browser}'. "
+              f"options: edge, edge-stable, chrome, safari, firefox", file=sys.stderr)
+        return 2
+
+    try:
+        auth_token, ct0 = _extract_cookies_via_provider(provider, json.dumps(opts))
+    except RuntimeError as e:
+        print(f"cookie extraction failed:\n{e}", file=sys.stderr)
+        return 1
+    except subprocess.TimeoutExpired:
+        print(f"cookie extraction timed out after 45s "
+              f"(may need Keychain approval on first run — try `security unlock-keychain`)", file=sys.stderr)
+        return 1
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(CACHE_DIR), prefix=".cookies.", suffix=".env")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(f"# tx cookies — extracted from {source} at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"AUTH_TOKEN={auth_token}\n")
+            f.write(f"CT0={ct0}\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, COOKIES_FILE)
+    except Exception:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+    print(f"saved → {COOKIES_FILE}  (source: {source}, mode 0600)")
+    print(f"valid until X session expires — re-run `tx cookies-save` after relogin")
+    return 0
+
+
+def cmd_archive(rest, cache):
+    """Port of ve-twini archive: bird bookmarks → SQLite."""
+    import sqlite3
+    from datetime import datetime
+    db_path = Path(os.environ.get("TX_DB", "~/.tx/bookmarks.db")).expanduser()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load saved cookies for non-interactive (e.g. launchd) runs
+    _load_cookies_env()
+
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS bookmarks (
+        tweet_id TEXT PRIMARY KEY, text TEXT,
+        author_username TEXT, author_name TEXT,
+        created_at TEXT, raw_json TEXT,
+        synced_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+    conn.commit()
+
+    r = _run(["bird", "bookmarks", "--json"])
+    if not r or r.returncode != 0:
+        err = (r.stderr if r else "no result").strip()
+        print(f"bird bookmarks failed: {err}", file=sys.stderr)
+        if r and _is_auth_error(err):
+            age, source, _ = _cookies_status()
+            if age is None:
+                print("\n  → cookies missing. run: tx cookies-save", file=sys.stderr)
+            else:
+                print(f"\n  → cookies likely expired ({age/86400:.0f}d old, from {source}).", file=sys.stderr)
+                print("    1) Open Edge Beta → x.com → make sure logged in", file=sys.stderr)
+                print("    2) Run: tx cookies-save", file=sys.stderr)
+        return 1
+    try:
+        tweets = json.loads(r.stdout)
+    except json.JSONDecodeError as e:
+        print(f"bird returned invalid JSON: {e}", file=sys.stderr)
+        return 1
+
+    cur.execute("SELECT tweet_id FROM bookmarks")
+    seen = {row[0] for row in cur.fetchall()}
+    new = [t for t in tweets if t.get("id") not in seen]
+
+    for t in new:
+        author = t.get("author") or {}
+        cur.execute("""INSERT OR REPLACE INTO bookmarks
+            (tweet_id, text, author_username, author_name, created_at, raw_json, synced_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (t.get("id"), t.get("text"),
+             author.get("username"), author.get("name"),
+             t.get("createdAt"), json.dumps(t),
+             datetime.utcnow().isoformat()))
+    conn.commit()
+    conn.close()
+    print(f"archived {len(new)} new bookmarks → {db_path}")
+    return 0
+
+
+# ---------- Routing ----------
+
+def suggest_similar(cmd, candidates):
+    matches = difflib.get_close_matches(cmd, candidates, n=3, cutoff=0.6)
+    if matches:
+        print(f"  did you mean: {', '.join(matches)}?", file=sys.stderr)
+
+
+def exec_or_fail(prog, args):
+    if not shutil.which(prog):
+        hint = {"bird": "npm i -g @steipete/bird",
+                "opencli": "npm i -g @jackwener/opencli"}.get(prog, "")
+        print(f"tx: {prog} not installed{'   →   ' + hint if hint else ''}", file=sys.stderr)
+        sys.exit(127)
+    os.execvp(prog, [prog] + args)
+
+
+def route(argv):
+    # Peel global flags
+    via = None
+    refresh = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            argv = argv[i + 1:]
+            break
+        if a in ("--help", "-h"):
+            cache = load_cache()
+            return cmd_help(argv[i + 1:], cache)
+        if a == "--version":
+            print(VERSION)
+            return 0
+        if a == "--refresh":
+            refresh = True
+            i += 1
+            continue
+        if a == "--via":
+            if i + 1 >= len(argv):
+                print("tx: --via requires bird|opencli", file=sys.stderr)
+                return 2
+            via = argv[i + 1]
+            if via not in ("bird", "opencli"):
+                print(f"tx: --via must be bird or opencli, got: {via}", file=sys.stderr)
+                return 2
+            i += 2
+            continue
+        # not a known global flag → assume subcommand starts here
+        argv = argv[i:]
+        break
+    else:
+        argv = argv[i:]
+
+    cache = load_cache(force_refresh=refresh)
+    if refresh and not argv:
+        print(f"cache rebuilt: {len(cache['bird'])} bird cmds, "
+              f"{len(cache['opencli_twitter'])} opencli twitter cmds, "
+              f"{len(cache['opencli_sites'])} adapters")
+        return 0
+
+    if not argv:
+        return cmd_help([], cache)
+
+    cmd = argv[0]
+    rest = argv[1:]
+
+    # Internal
+    if cmd == "help":
+        return cmd_help(rest, cache)
+    if cmd == "auth":
+        return cmd_auth(rest, cache)
+    if cmd == "doctor":
+        return cmd_doctor(rest, cache)
+    if cmd == "archive":
+        return cmd_archive(rest, cache)
+    if cmd == "cookies-save":
+        return cmd_cookies_save(rest, cache)
+
+    bird_cmds = set(cache["bird"])
+    oc_cmds = set(cache["opencli_twitter"])
+    sites = set(cache["opencli_sites"])
+
+    # --via override
+    if via == "bird":
+        if cmd not in bird_cmds:
+            print(f"tx: --via bird but '{cmd}' is not a bird command (continuing anyway)", file=sys.stderr)
+        exec_or_fail("bird", [cmd] + rest)
+    if via == "opencli":
+        if cmd not in oc_cmds and cmd not in sites:
+            print(f"tx: --via opencli but '{cmd}' is not an opencli twitter command (continuing anyway)", file=sys.stderr)
+        if cmd in sites:
+            exec_or_fail("opencli", [cmd] + rest)
+        exec_or_fail("opencli", ["twitter", cmd] + rest)
+
+    # Explicit `tx bird ...`
+    if cmd == "bird":
+        exec_or_fail("bird", rest)
+
+    # Site / app adapter (incl. "twitter")
+    if cmd in sites:
+        exec_or_fail("opencli", [cmd] + rest)
+
+    # Auto X-routing
+    in_b = cmd in bird_cmds
+    in_o = cmd in oc_cmds
+    if in_b:  # bird wins on collision and bird-only
+        exec_or_fail("bird", [cmd] + rest)
+    if in_o:
+        exec_or_fail("opencli", ["twitter", cmd] + rest)
+
+    # Unknown
+    all_cmds = bird_cmds | oc_cmds | sites | INTERNAL_CMDS | {"bird"}
+    print(f"tx: unknown command: {cmd}", file=sys.stderr)
+    suggest_similar(cmd, all_cmds)
+    print("  try: tx help", file=sys.stderr)
+    return 2
+
+
+def main():
+    try:
+        return route(sys.argv[1:]) or 0
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
