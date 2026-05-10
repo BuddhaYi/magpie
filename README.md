@@ -1,6 +1,12 @@
 # magpie 🐦
 
-> Unified CLI for X/Twitter (via [bird](https://github.com/steipete/bird)) and 132 other sites (via [opencli](https://github.com/jackwener/opencli)). Magpies hoard shiny things — so does this one.
+![X CLI](https://img.shields.io/badge/X%2FTwitter-CLI-1DA1F2)
+![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue)
+![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
+![GitHub stars](https://img.shields.io/github/stars/BuddhaYi/magpie?style=social)
+
+> **Unified macOS CLI for X/Twitter + 132 sites.** Combines [`bird`](https://github.com/steipete/bird) (GraphQL API) and [`opencli`](https://github.com/jackwener/opencli) (browser automation) into one router with risk-aware backend selection. Drop-in alternative to `ve-twini` with full coverage of all 180+ commands. Magpies hoard shiny things — so does this one.
 
 ```bash
 tx search "Claude Code"        # → bird (fast GraphQL)
