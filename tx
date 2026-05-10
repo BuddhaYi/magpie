@@ -168,8 +168,10 @@ def cmd_help(rest, cache):
     bird = sorted(cache["bird"])
     oc = cache["opencli_twitter"]
     sites = sorted(cache["opencli_sites"])
-    overlap = [c for c in bird if c in oc]
-    only_bird = [c for c in bird if c not in oc]
+    SOCIAL_WRITES_HELP = {"follow", "unfollow", "reply"}
+    overlap_bird = [c for c in bird if c in oc and c not in SOCIAL_WRITES_HELP]
+    overlap_oc = [c for c in bird if c in oc and c in SOCIAL_WRITES_HELP]
+    only_bird = [c for c in bird if c not in oc and c != "tweet"]
     only_oc = sorted(c for c in oc if c not in cache["bird"])
 
     print(f"tx {VERSION}  —  unified bird + opencli router")
@@ -193,10 +195,12 @@ def cmd_help(rest, cache):
     print("  tx doctor                diagnose installation")
     print("  tx help <cmd>            forward to backing tool's --help")
     print()
-    print(f"X COMMANDS — auto-routed  ({len(only_bird)} bird-only, {len(only_oc)} opencli-only, {len(overlap)} overlap → bird)")
-    print("  bird-only :", " ".join(only_bird))
-    print("  opencli-only :", " ".join(only_oc))
-    print("  overlap (→ bird) :", " ".join(overlap))
+    print(f"X COMMANDS — auto-routed")
+    print(f"  bird-only ({len(only_bird)}, read=fast):", " ".join(only_bird))
+    print(f"  opencli-only ({len(only_oc)}, browser=safe):", " ".join(only_oc))
+    print(f"  overlap → bird ({len(overlap_bird)}, reads + self-writes):", " ".join(overlap_bird))
+    print(f"  overlap → opencli ({len(overlap_oc)}, social-writes):", " ".join(overlap_oc))
+    print(f"  alias → opencli post:  tweet  (X content creation defaults to browser)")
     print()
     print(f"SITE / APP ADAPTERS  ({len(sites)})  — usage: tx <name> <verb> [args...]")
     cols = 6
@@ -599,10 +603,25 @@ def route(argv):
     if cmd in sites:
         exec_or_fail("opencli", [cmd] + rest)
 
+    # Social-write commands route to opencli (real browser) by default for
+    # lower anti-bot fingerprint. Speed is irrelevant for these (a human
+    # spends seconds-to-minutes deciding to do each one). Override: tx --via bird.
+    SOCIAL_WRITES = {"follow", "unfollow", "reply"}
+    # `tweet` (bird) and `post` (opencli) both create a new tweet. Treat `tweet`
+    # as an alias of `post` → opencli, same anti-bot reasoning.
+    TWEET_ALIASES = {"tweet": "post"}
+
     # Auto X-routing
     in_b = cmd in bird_cmds
     in_o = cmd in oc_cmds
-    if in_b:  # bird wins on collision and bird-only
+
+    # tweet alias → opencli post
+    if cmd in TWEET_ALIASES:
+        exec_or_fail("opencli", ["twitter", TWEET_ALIASES[cmd]] + rest)
+
+    if in_b and in_o and cmd in SOCIAL_WRITES:
+        exec_or_fail("opencli", ["twitter", cmd] + rest)
+    if in_b:  # bird wins on read overlap & bird-only
         exec_or_fail("bird", [cmd] + rest)
     if in_o:
         exec_or_fail("opencli", ["twitter", cmd] + rest)
