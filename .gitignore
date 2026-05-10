@@ -43,3 +43,6 @@ dist/
 *.bak
 *.orig
 .tx/
+
+# Development context — keep local only
+CLAUDE.md
