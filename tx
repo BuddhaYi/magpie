@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
-"""tx — unified router for bird (X GraphQL) + opencli (browser automation).
+"""tx — unified router across 3 X/Twitter backends + 132 site adapters.
+
+Backends:
+  bird          npm @steipete/bird          plain-HTTPS GraphQL (fallback for unique cmds)
+  twitter-cli   uv tool twitter-cli         curl_cffi + TLS impersonation + write jitter ⭐
+  opencli       npm @jackwener/opencli      Chromium browser bridge (132 site adapters)
 
 Routing rules (after stripping global flags):
-  1. internal cmd (auth/archive/doctor/help/--refresh/--version)  → handled here
-  2. tx bird <args...>          → exec bird
-  3. tx <site> <args...>        → exec opencli <site>     (site = opencli site or app adapter)
-  4. tx --via bird <cmd>        → exec bird
-  5. tx --via opencli <cmd>     → exec opencli twitter
-  6. cmd in BOTH bird & opencli → bird wins (faster)
-  7. cmd in only one            → that one
-  8. unknown                    → suggest similar, exit 2
+  1. internal cmd (auth/archive/cookies-save/doctor/help)              → handled here
+  2. tx bird|twitter-cli <args...>                                     → exec respective tool
+  3. tx <site> <args...>                                               → exec opencli <site>
+  4. tx --via <bird|twitter-cli|opencli> <cmd>                         → forced backend
+  5. cmd in twitter-cli                                                → twitter-cli (TLS, best for X)
+  6. cmd in bird                                                       → bird (mentions/news/about)
+  7. cmd in opencli                                                    → opencli (block/notif/etc)
+  8. unknown                                                           → suggest similar, exit 2
 
 Global flags (must come BEFORE the subcommand):
-  --refresh             rebuild discovery cache
-  --version             print version
-  --via <bird|opencli>  force backend
-  --help / -h           show this help
-  --                    end of tx flags (rest is passthrough)
+  --refresh                            rebuild discovery cache
+  --version                            print version
+  --via <bird|twitter-cli|opencli>     force backend
+  --help / -h                          show this help
+  --                                   end of tx flags (rest is passthrough)
 
 Cache: ~/.tx/cache.json (rebuilt every 7d or via --refresh).
+Cookies: ~/.tx/cookies.env exports both bird-style (AUTH_TOKEN) and
+         twitter-cli-style (TWITTER_AUTH_TOKEN) — extract once via tx cookies-save.
 """
 import difflib
 import json
@@ -31,7 +38,7 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.3.0"
 CACHE_DIR = Path.home() / ".tx"
 CACHE_FILE = CACHE_DIR / "cache.json"
 CACHE_TTL = 7 * 24 * 3600  # 7 days
@@ -74,6 +81,33 @@ def parse_bird_cmds():
     return cmds
 
 
+def parse_twitter_cli_cmds():
+    """Parse `twitter --help` for top-level subcommands.
+
+    twitter-cli (jackwener/twitter-cli) is a Python X CLI with TLS-fingerprint
+    impersonation via curl_cffi — preferred over bird for both reads and writes
+    when available. Install: `uv tool install twitter-cli` or `pipx install twitter-cli`.
+    """
+    if not shutil.which("twitter"):
+        return set()
+    res = _run(["twitter", "--help"])
+    if not res or res.returncode != 0:
+        return set()
+    cmds = set()
+    in_section = False
+    for line in res.stdout.splitlines():
+        if line.startswith("Commands:"):
+            in_section = True
+            continue
+        if in_section:
+            m = re.match(r"^\s+([a-z][\w-]*)\s+\S", line)
+            if m:
+                cmds.add(m.group(1))
+            elif line.strip() == "":
+                continue
+    return cmds
+
+
 def parse_opencli_twitter():
     if not shutil.which("opencli"):
         return {}
@@ -113,9 +147,10 @@ def parse_opencli_adapters():
 def build_cache():
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     data = {
-        "version": 1,
+        "version": 2,
         "built_at": time.time(),
         "bird": sorted(parse_bird_cmds()),
+        "twitter_cli": sorted(parse_twitter_cli_cmds()),
         "opencli_twitter": parse_opencli_twitter(),
         "opencli_sites": sorted(parse_opencli_adapters()),
     }
@@ -140,7 +175,11 @@ def load_cache(force_refresh=False):
     if time.time() - CACHE_FILE.stat().st_mtime > CACHE_TTL:
         return build_cache()
     try:
-        return json.loads(CACHE_FILE.read_text())
+        data = json.loads(CACHE_FILE.read_text())
+        # backfill v1 caches missing twitter_cli key (v0.2 → v0.3 migration)
+        if "twitter_cli" not in data:
+            return build_cache()
+        return data
     except (json.JSONDecodeError, OSError):
         return build_cache()
 
@@ -153,11 +192,17 @@ def cmd_help(rest, cache):
         sub = rest[0]
         sites = set(cache["opencli_sites"])
         bird = set(cache["bird"])
+        tw = set(cache.get("twitter_cli", []))
         oc = cache["opencli_twitter"]
-        if sub == "bird":
+        if sub in ("bird",):
             os.execvp("bird", ["bird", "--help"])
+        if sub in ("twitter-cli", "twitter_cli", "twitter"):
+            os.execvp("twitter", ["twitter", "--help"])
         if sub in sites:
             os.execvp("opencli", ["opencli", sub, "--help"])
+        # priority for sub-help: twitter-cli > bird > opencli (matches routing)
+        if sub in tw:
+            os.execvp("twitter", ["twitter", sub, "--help"])
         if sub in bird:
             os.execvp("bird", ["bird", sub, "--help"])
         if sub in oc:
@@ -165,28 +210,29 @@ def cmd_help(rest, cache):
         print(f"unknown command: {sub}", file=sys.stderr)
         return 2
     # categorized listing
-    bird = sorted(cache["bird"])
-    oc = cache["opencli_twitter"]
+    bird = set(cache["bird"])
+    tw = set(cache.get("twitter_cli", []))
+    oc = set(cache["opencli_twitter"])
     sites = sorted(cache["opencli_sites"])
-    SOCIAL_WRITES_HELP = {"follow", "unfollow", "reply"}
-    overlap_bird = [c for c in bird if c in oc and c not in SOCIAL_WRITES_HELP]
-    overlap_oc = [c for c in bird if c in oc and c in SOCIAL_WRITES_HELP]
-    only_bird = [c for c in bird if c not in oc and c != "tweet"]
-    only_oc = sorted(c for c in oc if c not in cache["bird"])
+    # Categorize per backend uniqueness for help display
+    twitter_cli_only = sorted(tw - bird - oc)
+    bird_only = sorted(bird - tw - oc - {"tweet"})  # tweet is alias-resolved
+    opencli_only = sorted(oc - bird - tw)
+    twitter_cli_wins = sorted((bird & tw) | (tw & oc) | (bird & tw & oc))
 
-    print(f"tx {VERSION}  —  unified bird + opencli router")
+    print(f"tx {VERSION}  —  unified twitter-cli + bird + opencli router")
     print()
     print("USAGE")
     print("  tx [global-flags] <command> [args...]")
     print()
     print("GLOBAL FLAGS  (must precede the subcommand)")
-    print("  --refresh                rebuild discovery cache")
-    print("  --version                print version")
-    print("  --via <bird|opencli>     force backend (e.g. --via opencli search 'x')")
-    print("  --help, -h               this help")
+    print("  --refresh                                rebuild discovery cache")
+    print("  --version                                print version")
+    print("  --via <bird|twitter-cli|opencli>         force backend")
+    print("  --help, -h                               this help")
     print()
     print("INTERNAL")
-    print("  tx auth                  check bird + opencli auth status")
+    print("  tx auth                  check bird + twitter-cli + opencli auth status")
     print("  tx archive               sync X bookmarks → ~/.tx/bookmarks.db")
     print("  tx cookies-save [--from edge|chrome|safari|firefox|edge-stable]")
     print("                           extract X cookies → ~/.tx/cookies.env (default: edge)")
@@ -195,12 +241,20 @@ def cmd_help(rest, cache):
     print("  tx doctor                diagnose installation")
     print("  tx help <cmd>            forward to backing tool's --help")
     print()
-    print(f"X COMMANDS — auto-routed")
-    print(f"  bird-only ({len(only_bird)}, read=fast):", " ".join(only_bird))
-    print(f"  opencli-only ({len(only_oc)}, browser=safe):", " ".join(only_oc))
-    print(f"  overlap → bird ({len(overlap_bird)}, reads + self-writes):", " ".join(overlap_bird))
-    print(f"  overlap → opencli ({len(overlap_oc)}, social-writes):", " ".join(overlap_oc))
-    print(f"  alias → opencli post:  tweet  (X content creation defaults to browser)")
+    print(f"X COMMANDS — auto-routed (priority: twitter-cli > bird > opencli)")
+    print(f"  twitter-cli ({len(tw)} cmds, TLS impersonation + jitter):")
+    if twitter_cli_wins:
+        print(f"    overlap (wins by default): {' '.join(twitter_cli_wins)}")
+    if twitter_cli_only:
+        print(f"    twitter-cli-only:          {' '.join(twitter_cli_only)}")
+    print(f"  bird-only ({len(bird_only)}, fallback for unique cmds):")
+    if bird_only:
+        print(f"    {' '.join(bird_only)}")
+    print(f"  opencli-only ({len(opencli_only)}, browser-required):")
+    if opencli_only:
+        print(f"    {' '.join(opencli_only)}")
+    print(f"  Note: `tx tweet <id>` views a tweet (twitter-cli).")
+    print(f"        Use `tx post \"text\"` to create a new tweet.")
     print()
     print(f"SITE / APP ADAPTERS  ({len(sites)})  — usage: tx <name> <verb> [args...]")
     cols = 6
@@ -209,6 +263,7 @@ def cmd_help(rest, cache):
     print()
     print("ESCAPES")
     print("  tx bird <args>           force bird")
+    print("  tx twitter-cli <args>    force twitter-cli")
     print("  tx <site> <args>         force opencli <site> (incl. tx twitter)")
     return 0
 
@@ -227,6 +282,19 @@ def cmd_auth(rest, cache):
             if r: print(" ", (r.stderr or r.stdout).strip())
     else:
         print("  ❌ bird not installed   →   npm i -g @steipete/bird")
+    print()
+    print("[twitter-cli]")
+    if shutil.which("twitter"):
+        _load_cookies_env()
+        r = _run(["twitter", "status"])
+        if r and r.returncode == 0:
+            for line in r.stdout.splitlines()[:6]:
+                print(" ", line)
+        else:
+            print("  ❌ twitter status failed")
+            if r: print(" ", (r.stderr or r.stdout).strip())
+    else:
+        print("  ❌ twitter-cli not installed   →   uv tool install twitter-cli")
     print()
     print("[opencli]")
     if shutil.which("opencli"):
@@ -255,20 +323,24 @@ def cmd_auth(rest, cache):
 
 def cmd_doctor(rest, cache):
     print(f"tx {VERSION}")
-    print(f"  bird:      {shutil.which('bird') or 'NOT FOUND'}")
-    print(f"  opencli:   {shutil.which('opencli') or 'NOT FOUND'}")
-    print(f"  cache:     {CACHE_FILE}  ({'exists' if CACHE_FILE.exists() else 'missing'})")
+    print(f"  bird:        {shutil.which('bird') or 'NOT FOUND'}")
+    print(f"  twitter-cli: {shutil.which('twitter') or 'NOT FOUND'}")
+    print(f"  opencli:     {shutil.which('opencli') or 'NOT FOUND'}")
+    print(f"  cache:       {CACHE_FILE}  ({'exists' if CACHE_FILE.exists() else 'missing'})")
     if CACHE_FILE.exists():
         age = time.time() - CACHE_FILE.stat().st_mtime
-        print(f"  age:       {age / 3600:.1f} h  (TTL {CACHE_TTL / 3600:.0f} h)")
-    print(f"  bird cmds: {len(cache['bird'])}")
+        print(f"  age:         {age / 3600:.1f} h  (TTL {CACHE_TTL / 3600:.0f} h)")
+    print(f"  bird cmds:           {len(cache['bird'])}")
+    print(f"  twitter-cli cmds:    {len(cache.get('twitter_cli', []))}")
     print(f"  opencli twitter cmds: {len(cache['opencli_twitter'])}")
-    print(f"  opencli adapters: {len(cache['opencli_sites'])}")
+    print(f"  opencli adapters:    {len(cache['opencli_sites'])}")
     return 0
 
 
 def _load_cookies_env():
-    """Read AUTH_TOKEN/CT0 from ~/.tx/cookies.env into the current env (for subprocesses)."""
+    """Read cookies from ~/.tx/cookies.env into env. Exports both bird-style
+    (AUTH_TOKEN/CT0) and twitter-cli-style (TWITTER_AUTH_TOKEN/TWITTER_CT0)
+    aliases so all 3 backends find the cookies."""
     if not COOKIES_FILE.exists():
         return
     try:
@@ -277,7 +349,13 @@ def _load_cookies_env():
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, _, v = line.partition("=")
-            os.environ.setdefault(k.strip(), v.strip())
+            k, v = k.strip(), v.strip()
+            os.environ.setdefault(k, v)
+            # mirror to twitter-cli's expected env var names
+            if k == "AUTH_TOKEN":
+                os.environ.setdefault("TWITTER_AUTH_TOKEN", v)
+            elif k == "CT0":
+                os.environ.setdefault("TWITTER_CT0", v)
     except OSError:
         pass
 
@@ -463,10 +541,19 @@ def cmd_archive(rest, cache):
         synced_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
     conn.commit()
 
-    r = _run(["bird", "bookmarks", "--json"])
+    # Prefer twitter-cli for fetch (TLS impersonation = lower rate-limit risk),
+    # fall back to bird if twitter-cli not installed.
+    use_twitter_cli = shutil.which("twitter") is not None
+    if use_twitter_cli:
+        r = _run(["twitter", "bookmarks", "--json"])
+        backend_label = "twitter-cli"
+    else:
+        r = _run(["bird", "bookmarks", "--json"])
+        backend_label = "bird"
+
     if not r or r.returncode != 0:
         err = (r.stderr if r else "no result").strip()
-        print(f"bird bookmarks failed: {err}", file=sys.stderr)
+        print(f"{backend_label} bookmarks failed: {err}", file=sys.stderr)
         if r and _is_auth_error(err):
             age, source, _ = _cookies_status()
             if age is None:
@@ -477,9 +564,16 @@ def cmd_archive(rest, cache):
                 print("    2) Run: tx cookies-save", file=sys.stderr)
         return 1
     try:
-        tweets = json.loads(r.stdout)
+        parsed = json.loads(r.stdout)
+        # twitter-cli wraps payload in {ok, schema_version, data: [...]}
+        # bird returns a bare list
+        if isinstance(parsed, dict) and "data" in parsed:
+            data = parsed["data"]
+            tweets = data if isinstance(data, list) else data.get("tweets", [])
+        else:
+            tweets = parsed
     except json.JSONDecodeError as e:
-        print(f"bird returned invalid JSON: {e}", file=sys.stderr)
+        print(f"{backend_label} returned invalid JSON: {e}", file=sys.stderr)
         return 1
 
     cur.execute("SELECT tweet_id FROM bookmarks")
@@ -488,11 +582,13 @@ def cmd_archive(rest, cache):
 
     for t in new:
         author = t.get("author") or {}
+        # bird uses author.username, twitter-cli uses author.screenName
+        username = author.get("screenName") or author.get("username")
         cur.execute("""INSERT OR REPLACE INTO bookmarks
             (tweet_id, text, author_username, author_name, created_at, raw_json, synced_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (t.get("id"), t.get("text"),
-             author.get("username"), author.get("name"),
+             username, author.get("name"),
              t.get("createdAt"), json.dumps(t),
              datetime.utcnow().isoformat()))
     conn.commit()
@@ -540,10 +636,10 @@ def route(argv):
             continue
         if a == "--via":
             if i + 1 >= len(argv):
-                print("tx: --via requires bird|opencli", file=sys.stderr)
+                print("tx: --via requires bird|twitter-cli|opencli", file=sys.stderr)
                 return 2
             via = argv[i + 1]
-            if via not in ("bird", "opencli"):
+            if via not in ("bird", "twitter-cli", "twitter_cli", "opencli"):
                 print(f"tx: --via must be bird or opencli, got: {via}", file=sys.stderr)
                 return 2
             i += 2
@@ -580,6 +676,7 @@ def route(argv):
         return cmd_cookies_save(rest, cache)
 
     bird_cmds = set(cache["bird"])
+    tw_cmds = set(cache.get("twitter_cli", []))
     oc_cmds = set(cache["opencli_twitter"])
     sites = set(cache["opencli_sites"])
 
@@ -588,6 +685,11 @@ def route(argv):
         if cmd not in bird_cmds:
             print(f"tx: --via bird but '{cmd}' is not a bird command (continuing anyway)", file=sys.stderr)
         exec_or_fail("bird", [cmd] + rest)
+    if via in ("twitter-cli", "twitter_cli"):
+        if cmd not in tw_cmds:
+            print(f"tx: --via twitter-cli but '{cmd}' is not a twitter-cli command (continuing anyway)", file=sys.stderr)
+        _load_cookies_env()
+        exec_or_fail("twitter", [cmd] + rest)
     if via == "opencli":
         if cmd not in oc_cmds and cmd not in sites:
             print(f"tx: --via opencli but '{cmd}' is not an opencli twitter command (continuing anyway)", file=sys.stderr)
@@ -595,33 +697,36 @@ def route(argv):
             exec_or_fail("opencli", [cmd] + rest)
         exec_or_fail("opencli", ["twitter", cmd] + rest)
 
-    # Explicit `tx bird ...`
+    # Explicit escape hatches
     if cmd == "bird":
         exec_or_fail("bird", rest)
+    if cmd in ("twitter-cli", "twitter_cli"):
+        _load_cookies_env()
+        exec_or_fail("twitter", rest)
 
-    # Site / app adapter (incl. "twitter")
+    # Site / app adapter (incl. "twitter" — opencli's site adapter)
     if cmd in sites:
         exec_or_fail("opencli", [cmd] + rest)
 
-    # Social-write commands route to opencli (real browser) by default for
-    # lower anti-bot fingerprint. Speed is irrelevant for these (a human
-    # spends seconds-to-minutes deciding to do each one). Override: tx --via bird.
-    SOCIAL_WRITES = {"follow", "unfollow", "reply"}
-    # `tweet` (bird) and `post` (opencli) both create a new tweet. Treat `tweet`
-    # as an alias of `post` → opencli, same anti-bot reasoning.
-    TWEET_ALIASES = {"tweet": "post"}
-
-    # Auto X-routing
+    # No name aliasing in v0.3 — `tweet` collides between backends (bird = post,
+    # twitter-cli = view by id), and silent translation is dangerous. Users:
+    #   - `tx post "text"`   → create a new tweet (twitter-cli)
+    #   - `tx tweet <id>`    → view a tweet by id (twitter-cli)
+    #   - `tx read <id>`     → view (bird's name)
+    in_t = cmd in tw_cmds
     in_b = cmd in bird_cmds
     in_o = cmd in oc_cmds
 
-    # tweet alias → opencli post
-    if cmd in TWEET_ALIASES:
-        exec_or_fail("opencli", ["twitter", TWEET_ALIASES[cmd]] + rest)
-
-    if in_b and in_o and cmd in SOCIAL_WRITES:
-        exec_or_fail("opencli", ["twitter", cmd] + rest)
-    if in_b:  # bird wins on read overlap & bird-only
+    # Auto-route — priority: twitter-cli > bird > opencli twitter
+    # Rationale (v0.3, "extreme use" optimized):
+    #   - twitter-cli has TLS impersonation (curl_cffi) for reads
+    #   - twitter-cli has 1.5-4s jitter for writes (built-in anti-bot)
+    #   - bird has plain HTTPS — only used for its unique commands (mentions/news/about)
+    #   - opencli is browser — only used for its unique commands (block/notifications/etc)
+    if in_t:
+        _load_cookies_env()
+        exec_or_fail("twitter", [cmd] + rest)
+    if in_b:
         exec_or_fail("bird", [cmd] + rest)
     if in_o:
         exec_or_fail("opencli", ["twitter", cmd] + rest)

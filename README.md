@@ -6,17 +6,19 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 ![GitHub stars](https://img.shields.io/github/stars/BuddhaYi/magpie?style=social)
 
-> **Unified macOS CLI for X/Twitter + 132 sites.** Combines [`bird`](https://github.com/steipete/bird) (GraphQL API) and [`opencli`](https://github.com/jackwener/opencli) (browser automation) into one router with risk-aware backend selection. Drop-in alternative to `ve-twini` with full coverage of all 180+ commands. Magpies hoard shiny things — so does this one.
+> **Unified macOS CLI for X/Twitter + 132 sites.** One router across [`twitter-cli`](https://github.com/public-clis/twitter-cli) (TLS-impersonating GraphQL), [`bird`](https://github.com/steipete/bird) (fallback for unique cmds), and [`opencli`](https://github.com/jackwener/opencli) (browser automation + 132 site adapters). Drop-in alternative to `ve-twini` with full coverage of all 200+ commands. Magpies hoard shiny things — so does this one.
 
 ```bash
-tx search "Claude Code"        # → bird (fast GraphQL)
-tx follow karpathy             # → opencli (real browser, lower anti-bot fingerprint)
-tx tweet "hello world"         # → opencli (alias for post — content writes go via browser)
+tx search "Claude Code"        # → twitter-cli (TLS impersonation, best for X reads)
+tx post "hello world"          # → twitter-cli (1.5-4s write jitter built-in)
+tx like https://x.com/.../...  # → twitter-cli
+tx mentions                    # → bird (only bird has clean mentions filter)
+tx block @spam_user            # → opencli (browser-only operation)
 tx arxiv search "vision"       # → opencli arxiv adapter
-tx archive                     # incremental SQLite sync of X bookmarks
+tx archive                     # incremental SQLite sync of X bookmarks (via twitter-cli)
 ```
 
-One short binary that **routes 180+ commands** across two backends — with risk-aware defaults so reads go via the fast API and social writes go via a real browser.
+Single ~700-line Python file, **zero pip dependencies**, **3-backend routing** with automatic priority.
 
 ---
 
@@ -24,9 +26,9 @@ One short binary that **routes 180+ commands** across two backends — with risk
 
 | Pain | Solution |
 |---|---|
-| `bird` covers X but only X. `opencli` covers 132 sites with different verb names. | One unified `tx` with consistent verbs |
-| Hand-coding wrappers for every command means upgrades break things. | All commands auto-discovered from `bird --help` and `opencli list` |
-| Reads should be fast (API), social writes should be stealthy (browser) — but pure "all writes via browser" wastes 10× time on harmless operations like bookmarking. | Routing splits **reads / self-writes → bird** and **social writes → opencli**, automatically |
+| `bird` covers X but lacks TLS-level anti-detection. `twitter-cli` has it but lacks `mentions`/`news`. `opencli` covers 132 sites and DM/block ops nothing else has. | One unified `tx` calling each for what it's best at |
+| Hand-coding wrappers for every command means upgrades break things. | All commands auto-discovered from each tool's `--help` output |
+| At extreme usage volumes, browser-driven writes (5-15s each) become unusable. Plain HTTPS (bird) gets fingerprinted. | Default writes via **twitter-cli** (1.5-4s + TLS impersonation + jitter) |
 | Safari's ITP kills cookies after 7-30 days. Cron jobs can't read encrypted browser cookies. | One-time extraction → `~/.tx/cookies.env` (Edge Beta cookies last ~13 months) |
 | Cookie expiration is silent — you find out weeks later your archive is broken. | `tx auth` shows fresh / aging / stale / expired status with renewal hints |
 
@@ -37,10 +39,13 @@ One short binary that **routes 180+ commands** across two backends — with risk
 ### Prerequisites
 
 ```bash
-# 1. Node-based upstream tools
+# 1. Node-based upstream tools (bird = fallback for unique cmds; opencli = browser + 132 sites)
 npm install -g @steipete/bird @jackwener/opencli
 
-# 2. Python 3.10+ (stdlib only, no pip deps)
+# 2. Python-based primary X backend (TLS impersonation)
+uv tool install twitter-cli      # or: pipx install twitter-cli
+
+# 3. Python 3.10+ for magpie itself (stdlib only, no pip deps)
 python3 --version
 ```
 
@@ -71,35 +76,43 @@ For `opencli` write operations (like, retweet, follow, post, reply, ...), you al
 tx <command> [args...]
        │
        ├─ Layer 1: internal       auth / archive / cookies-save / doctor / help
-       ├─ Layer 2: explicit       tx bird <args>   tx <site> <args>
-       ├─ Layer 3: --via flag     tx --via opencli search "x"
-       └─ Layer 4: auto-route
-            ├─ tweet alias        → opencli twitter post  (content creation defaults to browser)
-            ├─ social-write       → opencli  (follow / unfollow / reply)
-            ├─ overlap (other)    → bird     (reads + self-writes like bookmark)
-            ├─ bird-only          → bird
-            └─ opencli-only       → opencli twitter
+       ├─ Layer 2: explicit       tx bird|twitter-cli <args>     tx <site> <args>
+       ├─ Layer 3: --via flag     tx --via <bird|twitter-cli|opencli> <cmd>
+       └─ Layer 4: auto-route — PRIORITY: twitter-cli > bird > opencli
+            ├─ cmd in twitter-cli    → twitter-cli  (TLS reads, jitter writes)
+            ├─ cmd in bird only      → bird          (mentions / news / about / etc)
+            ├─ cmd in opencli only   → opencli       (block / notifications / DM / etc)
+            └─ unknown               → suggest similar, exit 2
 ```
 
-### Why "social-write → opencli" by default
+### Why twitter-cli is the default for X
 
-| Tier | Op | What it triggers in X | Default backend |
+| Layer | bird | twitter-cli | opencli |
 |---|---|---|---|
-| 0 | Reads of your own data (search/home/bookmarks/mentions) | Nothing X cares about | **bird** ✓ |
-| 1 | Private toggles (bookmark/unbookmark) | No notifications, no public visibility | **bird** ✓ |
-| 2 | Other-toggle (like/unlike) | Small notification footprint | **opencli** ✓ |
-| 3 | Social signal (follow/unfollow/retweet) | Public-graph mutation, anti-bot scrutiny | **opencli** ✓ |
-| 4 | Content creation (post/tweet/quote/reply) | Most scrutinized — anti-spam systems all watch this | **opencli** ✓ |
+| HTTP | plain Node fetch | **curl_cffi TLS impersonation** ⭐ | Chromium browser bridge |
+| Write delay | 0 | **1.5-4s random jitter** ⭐ | 5-15s (browser render) |
+| Speed | <1s | 1.5-4s | 5-15s |
+| Anti-detection | weak | **strong** | strongest |
+| Maturity | 32 releases | **2.4k stars, 32 releases** | 1.7k stars |
+| Best for | mentions / news / about | **everything else on X** | block / DM / 132 sites |
 
-A 5-10 second browser-driven action is invisible compared to the seconds-to-minutes a human spends deciding to perform a tier 3-4 operation. Spending those seconds on a real browser fingerprint reduces detection risk to ~zero.
+At extreme usage volumes (100+ writes per session), opencli is **functionally unusable** (5-15s each = 30+ minutes). twitter-cli's TLS+jitter combo is the sweet spot: fast enough for batch, stealthy enough to survive scrutiny.
+
+### Backend-unique commands (kept as fallback layers)
+
+| Tool | Unique commands (only this tool has them) |
+|---|---|
+| **bird** | `mentions` `news` `about` `replies` `home` `query-ids` `read` `list-timeline` (11 total) |
+| **opencli** | `block` `notifications` `download` `hide-reply` `list-add` `list-remove` `reply-dm` `accept` `timeline` `profile` `article` `tweets` `list-tweets` (13 total) |
 
 ### Override at will
 
 ```bash
-tx --via bird follow karpathy   # force GraphQL (faster, ~marginally higher detection footprint)
-tx --via opencli search "x"     # force browser (slower, no detection benefit for reads)
-tx bird tweet "raw"             # explicit bird passthrough (escape hatch)
-tx twitter post "via browser"   # opencli site adapter passthrough
+tx --via bird search "x"          # force bird (skip twitter-cli)
+tx --via opencli search "x"       # force opencli browser
+tx bird news --json               # explicit bird passthrough
+tx twitter-cli feed               # explicit twitter-cli passthrough
+tx twitter post "via opencli"     # opencli site adapter (note: `twitter` is opencli's site name)
 ```
 
 ---
@@ -108,21 +121,29 @@ tx twitter post "via browser"   # opencli site adapter passthrough
 
 | Command | Routes to | Purpose |
 |---|---|---|
-| `tx home` | bird | For You timeline |
-| `tx search "x"` | bird | search tweets |
-| `tx user-tweets karpathy` | bird | someone's recent tweets |
-| `tx thread <url>` | bird | full conversation tree |
-| `tx bookmarks` | bird | your bookmarks |
-| `tx like <url>` | opencli | like a tweet |
-| `tx retweet <url>` | opencli | retweet |
-| `tx follow karpathy` | **opencli** | follow user (was bird in v0.1) |
-| `tx reply <url> "text"` | **opencli** | reply (was bird in v0.1) |
-| `tx tweet "hi"` | **opencli** post | new tweet (alias, was bird in v0.1) |
-| `tx download karpathy` | opencli | download all media |
+| `tx feed` | twitter-cli | For You timeline (twitter-cli's name) |
+| `tx home` | bird | For You timeline (bird's name) |
+| `tx search "x"` | **twitter-cli** | search tweets (TLS-impersonated) |
+| `tx user karpathy` | twitter-cli | user profile |
+| `tx user-posts karpathy` | twitter-cli | someone's recent tweets |
+| `tx tweet <id>` | twitter-cli | view a tweet by id |
+| `tx thread <id>` | twitter-cli | conversation tree |
+| `tx bookmarks` | twitter-cli | your bookmarks (incl. folders) |
+| `tx mentions` | **bird** | tweets mentioning you (bird-only) |
+| `tx news` | **bird** | AI-curated Explore tab content (bird-only) |
+| `tx about karpathy` | **bird** | account origin/location (bird-only) |
+| `tx post "hi"` | twitter-cli | post a new tweet |
+| `tx like <id>` | twitter-cli | like a tweet |
+| `tx retweet <id>` | twitter-cli | retweet |
+| `tx follow karpathy` | twitter-cli | follow user |
+| `tx reply <id> "text"` | twitter-cli | reply |
+| `tx block @spam` | **opencli** | block (opencli-only) |
+| `tx notifications` | **opencli** | notifications center (opencli-only) |
+| `tx download karpathy` | **opencli** | download all user media |
 | `tx arxiv search "transformer"` | opencli arxiv | search arxiv |
 | `tx hackernews top` | opencli hackernews | HN front page |
-| `tx archive` | internal | sync bookmarks to SQLite |
-| `tx auth` | internal | health check (bird + opencli + cookie age) |
+| `tx archive` | internal | sync bookmarks to SQLite (uses twitter-cli) |
+| `tx auth` | internal | health check (3 backends + cookie age) |
 
 Run `tx help` for the full categorized list (50+ X commands + 136 site adapters).
 
@@ -198,8 +219,9 @@ Nothing leaves your machine. magpie does not phone home.
 magpie's defaults are tuned for **personal single-user CLI use**. For a single human:
 
 - **At default volumes (one human, manual + 1 archive/day)**: anti-bot risk is effectively zero
-- **Reads via bird are indistinguishable from web client behavior**
-- **Social writes via opencli use a real browser** — same fingerprint as you clicking manually
+- **Reads via twitter-cli use TLS impersonation** — request fingerprint matches real Chrome
+- **Writes via twitter-cli get built-in 1.5-4s random jitter** — closer to human pacing
+- **opencli writes via real browser** — used only when opencli has the exclusive command
 
 **What WILL trigger X risk controls (don't do these with magpie or anything else):**
 
@@ -215,32 +237,42 @@ magpie's defaults are tuned for **personal single-user CLI use**. For a single h
 
 ## Architecture
 
-**~660 LOC of Python, zero dependencies beyond stdlib.**
+**~700 LOC of Python, zero pip dependencies.**
 
 Routing is fully introspection-based:
 
 1. On first run (or `tx --refresh`), parse:
    - `bird --help` → set of bird commands
-   - `opencli twitter --help` → opencli twitter commands (with `[read]/[write]` tags)
+   - `twitter --help` → set of twitter-cli commands
+   - `opencli twitter --help` → opencli twitter commands
    - `opencli list` → 136 site/app adapters
 2. Cache to `~/.tx/cache.json` (TTL 7d)
-3. At command time: lookup → `os.execvp` (zero overhead post-routing)
+3. At command time: dict lookups → `os.execvp` (zero overhead post-routing)
 
-Key insight: both upstream tools have structured help output. magpie reads that structure rather than maintaining handwritten routing tables — **upgrades to bird/opencli automatically pick up new commands**.
+Key insight: all three upstream tools have structured help output. magpie reads that structure rather than maintaining handwritten routing tables — **upgrades to any backend automatically pick up new commands**.
 
 ### Cookie extraction details
 
-bird natively supports Safari/Chrome/Firefox cookie extraction but NOT Edge. magpie bypasses this by calling [`@steipete/sweet-cookie`](https://www.npmjs.com/package/@steipete/sweet-cookie) directly (bird's underlying library), which has Edge support — just not exposed through bird's CLI.
+bird supports Safari/Chrome/Firefox cookies; twitter-cli supports Arc/Chrome/Edge/Firefox/Brave. Neither supports Edge Beta natively. magpie bypasses by calling [`@steipete/sweet-cookie`](https://www.npmjs.com/package/@steipete/sweet-cookie) directly (bird's underlying library, has Edge support but bird doesn't expose it). Extracted cookies are saved to `~/.tx/cookies.env` and exported via both bird-style (`AUTH_TOKEN`/`CT0`) and twitter-cli-style (`TWITTER_AUTH_TOKEN`/`TWITTER_CT0`) env var names so all three backends find them.
 
 ---
 
 ## Changelog
 
-### v0.2 (current — risk-aware routing)
-- **Routing change**: `follow` / `unfollow` / `reply` now default to **opencli** (was bird)
-- **Alias added**: `tx tweet` → `opencli twitter post` (was bird `tweet`)
-- Rationale: tier-3-4 X operations (social writes & content creation) have higher anti-bot scrutiny; using a real browser fingerprint reduces risk to ~zero with negligible UX cost (5-10s for a single deliberate action)
-- Override: `tx --via bird <cmd>` or `tx bird <cmd>` if you need the API path
+### v0.3 (current — 3-backend routing)
+- **New backend**: `twitter-cli` added as primary X handler (curl_cffi TLS impersonation + 1.5-4s write jitter)
+- **Routing priority**: twitter-cli > bird > opencli
+- **bird role**: demoted to fallback for unique cmds (`mentions` / `news` / `about` / `replies` / `home`)
+- **opencli role**: kept for unique cmds (`block` / `notifications` / `download` / DM / etc) and 132 site adapters
+- `tx archive` now uses twitter-cli for bookmark fetch (gets more history than bird)
+- `~/.tx/cookies.env` auto-exports both `AUTH_TOKEN` and `TWITTER_AUTH_TOKEN` aliases
+- New: `tx --via twitter-cli <cmd>` and `tx twitter-cli <args>` escape hatches
+- Removed: `tweet` → `post` alias (would collide with twitter-cli's `tweet <id>` view command). Use `tx post "text"` to create, `tx tweet <id>` to view.
+
+### v0.2 (risk-aware routing)
+- **Routing change**: `follow` / `unfollow` / `reply` defaulted to opencli (browser stealth)
+- **Alias added**: `tx tweet` → `opencli twitter post`
+- Rationale: tier-3-4 X operations have higher anti-bot scrutiny
 
 ### v0.1
 - Initial release: bird + opencli routing, sweet-cookie Edge support, launchd template, SQLite archive
@@ -254,8 +286,9 @@ MIT — see [LICENSE](./LICENSE).
 ## Credits
 
 Built on top of:
-- [bird](https://github.com/steipete/bird) by Peter Steinberger — fast X CLI
-- [opencli](https://github.com/jackwener/opencli) by jackwener — universal site CLI
+- [twitter-cli](https://github.com/public-clis/twitter-cli) by jackwener — TLS-impersonating X CLI (primary X backend)
+- [bird](https://github.com/steipete/bird) by Peter Steinberger — fast X CLI (fallback for unique cmds)
+- [opencli](https://github.com/jackwener/opencli) by jackwener — universal site CLI (132 adapters + browser writes)
 - [sweet-cookie](https://www.npmjs.com/package/@steipete/sweet-cookie) — cookie extraction
 
-Inspired by [ve-twini](https://clianything.cc/) (which only exposes 5 commands) — magpie generalizes the bridge to all 180+.
+Inspired by [ve-twini](https://clianything.cc/) (which only exposes 5 commands) — magpie generalizes the bridge to all 200+ commands across three backends.

@@ -39,6 +39,7 @@ fi
 
 # Verify upstream tools
 missing=()
+command -v twitter  >/dev/null || missing+=("twitter-cli (uv tool install twitter-cli  OR  pipx install twitter-cli)")
 command -v bird     >/dev/null || missing+=("bird (npm i -g @steipete/bird)")
 command -v opencli  >/dev/null || missing+=("opencli (npm i -g @jackwener/opencli)")
 
