@@ -573,6 +573,22 @@ def _curl_download(url, dest_path):
     return res.returncode == 0
 
 
+def _upgrade_to_max_quality(media):
+    """Rewrite media URL to request highest available quality.
+
+    - Photos (pbs.twimg.com): force ?name=orig (~2× larger than medium default)
+    - Videos: twitter-cli already returns 720p-1080p variants — trust its choice
+    """
+    from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+    url = media.get("url", "")
+    if media.get("type") == "photo" and "pbs.twimg.com" in url:
+        parsed = urlparse(url)
+        query = dict(parse_qsl(parsed.query))
+        query["name"] = "orig"
+        return urlunparse(parsed._replace(query=urlencode(query)))
+    return url
+
+
 _TWEET_ID_RE = re.compile(r"/status/(\d+)")
 
 
@@ -678,8 +694,10 @@ def cmd_download(rest, cache):
             print(f"  [{idx}/{len(unique)}] {dest.name} already exists, skip")
             continue
         size_hint = f"{m.get('width','?')}x{m.get('height','?')}" if m.get("type") == "video" else m.get("type", "?")
-        print(f"  [{idx}/{len(unique)}] {size_hint} → {dest.name}")
-        if _curl_download(m["url"], dest):
+        download_url = _upgrade_to_max_quality(m)
+        quality_tag = " (orig)" if download_url != m["url"] else ""
+        print(f"  [{idx}/{len(unique)}] {size_hint}{quality_tag} → {dest.name}")
+        if _curl_download(download_url, dest):
             ok += 1
         else:
             print(f"     ⚠️  download failed", file=sys.stderr)
