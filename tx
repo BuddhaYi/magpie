@@ -43,7 +43,7 @@ CACHE_DIR = Path.home() / ".tx"
 CACHE_FILE = CACHE_DIR / "cache.json"
 CACHE_TTL = 7 * 24 * 3600  # 7 days
 
-INTERNAL_CMDS = {"auth", "archive", "cookies-save", "doctor", "help"}
+INTERNAL_CMDS = {"auth", "archive", "cookies-save", "doctor", "download", "help"}
 COOKIES_FILE = CACHE_DIR / "cookies.env"
 NPM_GLOBAL_LIB = Path.home() / ".npm-global" / "lib" / "node_modules"
 
@@ -214,10 +214,13 @@ def cmd_help(rest, cache):
     tw = set(cache.get("twitter_cli", []))
     oc = set(cache["opencli_twitter"])
     sites = sorted(cache["opencli_sites"])
-    # Categorize per backend uniqueness for help display
+    # Categorize per backend uniqueness for help display.
+    # `download` is intercepted by an internal handler (uses twitter-cli + curl),
+    # so don't display it as opencli-only even though opencli has the name.
+    INTERNAL_OVERRIDES = {"download"}
     twitter_cli_only = sorted(tw - bird - oc)
     bird_only = sorted(bird - tw - oc - {"tweet"})  # tweet is alias-resolved
-    opencli_only = sorted(oc - bird - tw)
+    opencli_only = sorted(oc - bird - tw - INTERNAL_OVERRIDES)
     twitter_cli_wins = sorted((bird & tw) | (tw & oc) | (bird & tw & oc))
 
     print(f"tx {VERSION}  —  unified twitter-cli + bird + opencli router")
@@ -234,6 +237,9 @@ def cmd_help(rest, cache):
     print("INTERNAL")
     print("  tx auth                  check bird + twitter-cli + opencli auth status")
     print("  tx archive               sync X bookmarks → ~/.tx/bookmarks.db")
+    print("  tx download <user> [--limit N] [--output DIR]")
+    print("  tx download --tweet-url <url> [--output DIR]")
+    print("                           download videos/images from tweets (twitter-cli + curl)")
     print("  tx cookies-save [--from edge|chrome|safari|firefox|edge-stable]")
     print("                           extract X cookies → ~/.tx/cookies.env (default: edge)")
     print("  tx cookies-save --check-age")
@@ -522,6 +528,167 @@ def cmd_cookies_save(rest, cache):
     return 0
 
 
+def _extract_media_urls(node, found=None):
+    """Recursively find all {type, url, width, height} media dicts in a twitter-cli
+    JSON response. Returns list of dicts. Handles single tweets, user-posts, search."""
+    if found is None:
+        found = []
+    if isinstance(node, dict):
+        if (
+            node.get("type") in ("video", "photo", "animated_gif")
+            and isinstance(node.get("url"), str)
+            and node["url"].startswith("http")
+        ):
+            found.append(node)
+        for v in node.values():
+            _extract_media_urls(v, found)
+    elif isinstance(node, list):
+        for x in node:
+            _extract_media_urls(x, found)
+    return found
+
+
+def _ext_for(media):
+    """Pick file extension by media type, falling back to URL."""
+    t = media.get("type")
+    if t == "video":
+        return ".mp4"
+    if t == "animated_gif":
+        return ".mp4"  # X serves GIFs as MP4
+    if t == "photo":
+        url = media.get("url", "")
+        for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+            if ext in url.lower():
+                return ext
+        return ".jpg"
+    return ".bin"
+
+
+def _curl_download(url, dest_path):
+    """Download URL to file via curl. Returns True on success."""
+    res = subprocess.run(
+        ["curl", "-fsSL", "-o", str(dest_path), url],
+        capture_output=True, text=True, timeout=300,
+    )
+    return res.returncode == 0
+
+
+_TWEET_ID_RE = re.compile(r"/status/(\d+)")
+
+
+def cmd_download(rest, cache):
+    """Download media (videos/images) from tweets via twitter-cli + curl.
+
+    Usage:
+      tx download <username>               # download user's recent N tweets' media
+      tx download --tweet-url <url>        # download a single tweet's media
+      tx download --tweet-id <id>          # same, by id
+      [--limit N]                          # default 10 for user mode
+      [--output DIR]                       # default ./twitter-downloads
+    """
+    # Parse args
+    tweet_id = None
+    username = None
+    limit = 10
+    output_dir = Path("./twitter-downloads")
+
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--tweet-url" and i + 1 < len(rest):
+            m = _TWEET_ID_RE.search(rest[i + 1])
+            if not m:
+                print(f"tx download: cannot parse tweet ID from URL: {rest[i + 1]}", file=sys.stderr)
+                return 2
+            tweet_id = m.group(1)
+            i += 2
+        elif a == "--tweet-id" and i + 1 < len(rest):
+            tweet_id = rest[i + 1]
+            i += 2
+        elif a in ("--limit", "-n") and i + 1 < len(rest):
+            limit = int(rest[i + 1])
+            i += 2
+        elif a in ("--output", "-o") and i + 1 < len(rest):
+            output_dir = Path(rest[i + 1]).expanduser()
+            i += 2
+        elif a.startswith("-"):
+            print(f"tx download: unknown flag: {a}", file=sys.stderr)
+            return 2
+        elif username is None and tweet_id is None:
+            username = a.lstrip("@")
+            i += 1
+        else:
+            print(f"tx download: unexpected arg: {a}", file=sys.stderr)
+            return 2
+
+    if not tweet_id and not username:
+        print(cmd_download.__doc__, file=sys.stderr)
+        return 2
+
+    if not shutil.which("twitter"):
+        print("tx download: twitter-cli not installed   →   uv tool install twitter-cli", file=sys.stderr)
+        return 1
+    if not shutil.which("curl"):
+        print("tx download: curl not found", file=sys.stderr)
+        return 1
+
+    _load_cookies_env()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Fetch metadata via twitter-cli
+    if tweet_id:
+        cmd = ["twitter", "tweet", tweet_id, "--json"]
+        label = f"tweet {tweet_id}"
+    else:
+        cmd = ["twitter", "user-posts", username, "--max", str(limit), "--json"]
+        label = f"@{username} (recent {limit})"
+
+    print(f"fetching media list from {label}...")
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if res.returncode != 0:
+        print(f"twitter-cli failed: {res.stderr.strip()}", file=sys.stderr)
+        return 1
+    try:
+        data = json.loads(res.stdout)
+    except json.JSONDecodeError as e:
+        print(f"twitter-cli returned invalid JSON: {e}", file=sys.stderr)
+        return 1
+
+    media_list = _extract_media_urls(data)
+    # Dedupe by URL (some tweets reference same media in multiple places)
+    seen = set()
+    unique = []
+    for m in media_list:
+        if m["url"] not in seen:
+            seen.add(m["url"])
+            unique.append(m)
+
+    if not unique:
+        print(f"no media found in {label}")
+        return 1
+
+    print(f"found {len(unique)} media item(s), downloading to {output_dir}/")
+    ok, fail = 0, 0
+    for idx, m in enumerate(unique, 1):
+        # filename: <tweet_id_or_username>_<idx><ext>
+        prefix = tweet_id or username
+        ext = _ext_for(m)
+        dest = output_dir / f"{prefix}_{idx}{ext}"
+        if dest.exists():
+            print(f"  [{idx}/{len(unique)}] {dest.name} already exists, skip")
+            continue
+        size_hint = f"{m.get('width','?')}x{m.get('height','?')}" if m.get("type") == "video" else m.get("type", "?")
+        print(f"  [{idx}/{len(unique)}] {size_hint} → {dest.name}")
+        if _curl_download(m["url"], dest):
+            ok += 1
+        else:
+            print(f"     ⚠️  download failed", file=sys.stderr)
+            fail += 1
+
+    print(f"\ndone: {ok} downloaded, {fail} failed")
+    return 0 if fail == 0 else 1
+
+
 def cmd_archive(rest, cache):
     """Port of ve-twini archive: bird bookmarks → SQLite."""
     import sqlite3
@@ -674,6 +841,8 @@ def route(argv):
         return cmd_archive(rest, cache)
     if cmd == "cookies-save":
         return cmd_cookies_save(rest, cache)
+    if cmd == "download":
+        return cmd_download(rest, cache)
 
     bird_cmds = set(cache["bird"])
     tw_cmds = set(cache.get("twitter_cli", []))
