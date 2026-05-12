@@ -10,6 +10,17 @@
 
 ![demo](./assets/demo.gif)
 
+<table>
+<tr>
+<td width="50%"><img src="./assets/screenshot-auth.png" alt="tx auth — 3 backends all green"></td>
+<td width="50%"><img src="./assets/screenshot-download.png" alt="tx download — max-quality video + orig images"></td>
+</tr>
+<tr>
+<td><sub><code>tx auth</code> — health check across <b>bird</b> + <b>twitter-cli</b> + <b>opencli</b>, plus cookie freshness</sub></td>
+<td><sub><code>tx download</code> — fetches max-bitrate video (1080p @ 10 Mbps) and original-resolution images from a single tweet URL</sub></td>
+</tr>
+</table>
+
 ```bash
 tx search "Claude Code"        # → twitter-cli (TLS impersonation, best for X reads)
 tx post "hello world"          # → twitter-cli (1.5-4s write jitter built-in)
