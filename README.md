@@ -8,6 +8,8 @@
 
 > **Unified macOS CLI for X/Twitter + 132 sites.** One router across [`twitter-cli`](https://github.com/public-clis/twitter-cli) (TLS-impersonating GraphQL), [`bird`](https://github.com/steipete/bird) (fallback for unique cmds), and [`opencli`](https://github.com/jackwener/opencli) (browser automation + 132 site adapters). Drop-in alternative to `ve-twini` with full coverage of all 200+ commands. Magpies hoard shiny things — so does this one.
 
+![demo](./assets/demo.gif)
+
 ```bash
 tx search "Claude Code"        # → twitter-cli (TLS impersonation, best for X reads)
 tx post "hello world"          # → twitter-cli (1.5-4s write jitter built-in)
@@ -16,9 +18,10 @@ tx mentions                    # → bird (only bird has clean mentions filter)
 tx block @spam_user            # → opencli (browser-only operation)
 tx arxiv search "vision"       # → opencli arxiv adapter
 tx archive                     # incremental SQLite sync of X bookmarks (via twitter-cli)
+tx download --tweet-url <url>  # max-quality video/image grab (via bird variants)
 ```
 
-Single ~700-line Python file, **zero pip dependencies**, **3-backend routing** with automatic priority.
+Single ~800-line Python file, **zero pip dependencies**, **3-backend routing** with automatic priority.
 
 ---
 
