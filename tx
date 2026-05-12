@@ -41,7 +41,36 @@ from pathlib import Path
 VERSION = "0.3.0"
 CACHE_DIR = Path.home() / ".tx"
 CACHE_FILE = CACHE_DIR / "cache.json"
+CONFIG_FILE = CACHE_DIR / "config.json"
 CACHE_TTL = 7 * 24 * 3600  # 7 days
+
+# Default download preferences — override via ~/.tx/config.json:
+#   {"download": {"video_quality": "max", "image_quality": "orig"}}
+# video_quality: max | medium | low | <kbps int>
+# image_quality: orig | large | medium | small
+DEFAULT_CONFIG = {
+    "download": {
+        "video_quality": "max",
+        "image_quality": "orig",
+    }
+}
+
+
+def _load_config():
+    if not CONFIG_FILE.exists():
+        return DEFAULT_CONFIG
+    try:
+        user = json.loads(CONFIG_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return DEFAULT_CONFIG
+    # shallow-merge with defaults
+    merged = {k: dict(v) if isinstance(v, dict) else v for k, v in DEFAULT_CONFIG.items()}
+    for k, v in user.items():
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            merged[k].update(v)
+        else:
+            merged[k] = v
+    return merged
 
 INTERNAL_CMDS = {"auth", "archive", "cookies-save", "doctor", "download", "help"}
 COOKIES_FILE = CACHE_DIR / "cookies.env"
@@ -528,23 +557,29 @@ def cmd_cookies_save(rest, cache):
     return 0
 
 
-def _extract_media_urls(node, found=None):
-    """Recursively find all {type, url, width, height} media dicts in a twitter-cli
-    JSON response. Returns list of dicts. Handles single tweets, user-posts, search."""
+def _extract_media_urls(node, tweet_id=None, found=None):
+    """Recursively find all media dicts in a twitter-cli JSON response, tagging
+    each with the containing tweet's id so we can later fetch variants per tweet.
+    """
     if found is None:
         found = []
     if isinstance(node, dict):
+        # tweet boundary: object with both `id` (str) and `text` (str) is a tweet
+        if isinstance(node.get("id"), str) and isinstance(node.get("text"), str):
+            tweet_id = node["id"]
         if (
             node.get("type") in ("video", "photo", "animated_gif")
             and isinstance(node.get("url"), str)
             and node["url"].startswith("http")
         ):
-            found.append(node)
+            entry = dict(node)
+            entry["_tweet_id"] = tweet_id
+            found.append(entry)
         for v in node.values():
-            _extract_media_urls(v, found)
+            _extract_media_urls(v, tweet_id, found)
     elif isinstance(node, list):
         for x in node:
-            _extract_media_urls(x, found)
+            _extract_media_urls(x, tweet_id, found)
     return found
 
 
@@ -573,20 +608,83 @@ def _curl_download(url, dest_path):
     return res.returncode == 0
 
 
-def _upgrade_to_max_quality(media):
-    """Rewrite media URL to request highest available quality.
+_IMAGE_QUALITY_MAP = {"orig": "orig", "large": "large", "medium": "medium", "small": "small"}
 
-    - Photos (pbs.twimg.com): force ?name=orig (~2× larger than medium default)
-    - Videos: twitter-cli already returns 720p-1080p variants — trust its choice
+
+def _upgrade_image_url(url, image_quality="orig"):
+    """Force pbs.twimg.com URL to a specific quality level.
+
+    Quality levels (small → orig): 680px → 1200px → 2048px → original upload.
     """
+    if "pbs.twimg.com" not in url:
+        return url
+    name = _IMAGE_QUALITY_MAP.get(image_quality, "orig")
     from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
-    url = media.get("url", "")
-    if media.get("type") == "photo" and "pbs.twimg.com" in url:
-        parsed = urlparse(url)
-        query = dict(parse_qsl(parsed.query))
-        query["name"] = "orig"
-        return urlunparse(parsed._replace(query=urlencode(query)))
-    return url
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query))
+    query["name"] = name
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def _get_video_variants(tweet_id):
+    """Fetch all mp4 video variants for a tweet via bird read --json-full.
+
+    Returns list sorted by bitrate descending. Each item: {url, bitrate, width, height}.
+    Empty list if bird unavailable or tweet has no video.
+    """
+    if not shutil.which("bird"):
+        return []
+    res = _run(["bird", "read", str(tweet_id), "--json-full"])
+    if not res or res.returncode != 0:
+        return []
+    try:
+        data = json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return []
+    found = []
+    def walk(node):
+        if isinstance(node, dict):
+            if (
+                node.get("content_type") == "video/mp4"
+                and isinstance(node.get("url"), str)
+            ):
+                m = re.search(r"/(\d+)x(\d+)/", node["url"])
+                found.append({
+                    "url": node["url"],
+                    "bitrate": int(node.get("bitrate") or 0),
+                    "width": int(m.group(1)) if m else 0,
+                    "height": int(m.group(2)) if m else 0,
+                })
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for x in node:
+                walk(x)
+    walk(data)
+    # dedupe by URL
+    seen = set()
+    unique = []
+    for v in found:
+        if v["url"] not in seen:
+            seen.add(v["url"])
+            unique.append(v)
+    return sorted(unique, key=lambda v: (v["bitrate"], v["width"]), reverse=True)
+
+
+def _select_variant(variants, preference):
+    """Pick a variant per preference. preference: 'max' | 'medium' | 'low' | int (target kbps)."""
+    if not variants:
+        return None
+    if preference == "max":
+        return variants[0]
+    if preference == "low":
+        return variants[-1]
+    if preference == "medium":
+        return variants[len(variants) // 2]
+    if isinstance(preference, int):
+        target = preference * 1000
+        return min(variants, key=lambda v: abs(v["bitrate"] - target))
+    return variants[0]
 
 
 _TWEET_ID_RE = re.compile(r"/status/(\d+)")
@@ -683,19 +781,51 @@ def cmd_download(rest, cache):
         print(f"no media found in {label}")
         return 1
 
+    # Load quality preferences from config
+    cfg = _load_config().get("download", {})
+    video_q = cfg.get("video_quality", "max")
+    image_q = cfg.get("image_quality", "orig")
+
     print(f"found {len(unique)} media item(s), downloading to {output_dir}/")
+    print(f"  quality: video={video_q}, image={image_q}")
     ok, fail = 0, 0
+    # Cache variants by tweet_id to avoid duplicate bird calls within a batch
+    variant_cache = {}
     for idx, m in enumerate(unique, 1):
-        # filename: <tweet_id_or_username>_<idx><ext>
         prefix = tweet_id or username
         ext = _ext_for(m)
         dest = output_dir / f"{prefix}_{idx}{ext}"
         if dest.exists():
             print(f"  [{idx}/{len(unique)}] {dest.name} already exists, skip")
             continue
-        size_hint = f"{m.get('width','?')}x{m.get('height','?')}" if m.get("type") == "video" else m.get("type", "?")
-        download_url = _upgrade_to_max_quality(m)
-        quality_tag = " (orig)" if download_url != m["url"] else ""
+
+        # Determine the best download URL based on media type
+        download_url = m["url"]
+        quality_tag = ""
+        m_type = m.get("type")
+
+        if m_type == "photo":
+            new_url = _upgrade_image_url(m["url"], image_q)
+            if new_url != m["url"]:
+                download_url = new_url
+                quality_tag = f" ({image_q})"
+        elif m_type in ("video", "animated_gif"):
+            tid = m.get("_tweet_id")
+            if tid:
+                if tid not in variant_cache:
+                    variant_cache[tid] = _get_video_variants(tid)
+                variants = variant_cache[tid]
+                chosen = _select_variant(variants, video_q)
+                if chosen and chosen["url"] != m["url"]:
+                    download_url = chosen["url"]
+                    quality_tag = f" → {chosen['width']}x{chosen['height']} @ {chosen['bitrate']//1000}k ({video_q})"
+                elif chosen:
+                    quality_tag = f" ({video_q}, already best)"
+
+        size_hint = (
+            f"{m.get('width','?')}x{m.get('height','?')}"
+            if m_type == "video" else m_type or "?"
+        )
         print(f"  [{idx}/{len(unique)}] {size_hint}{quality_tag} → {dest.name}")
         if _curl_download(download_url, dest):
             ok += 1

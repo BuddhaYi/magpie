@@ -206,11 +206,30 @@ Why a separate `cookies.env` file? launchd processes lack Full Disk Access — t
 | Path | Purpose | Sensitive? |
 |---|---|---|
 | `~/.tx/cache.json` | command discovery cache (TTL 7d) | no |
+| `~/.tx/config.json` | optional user prefs (download quality, etc) | no |
 | `~/.tx/cookies.env` | extracted X auth_token + ct0 | **YES** (mode 0600) |
 | `~/.tx/bookmarks.db` | SQLite archive of X bookmarks | personal |
 | `~/.tx/archive.log` | launchd output | personal |
 
 Nothing leaves your machine. magpie does not phone home.
+
+### Config (optional)
+
+Create `~/.tx/config.json` to override defaults:
+
+```json
+{
+  "download": {
+    "video_quality": "max",
+    "image_quality": "orig"
+  }
+}
+```
+
+| Key | Values | Effect |
+|---|---|---|
+| `download.video_quality` | `max` (default) / `medium` / `low` / `<kbps int>` | Picks variant from X's available video resolutions via bird's GraphQL response (variants list). `max` selects highest bitrate. Integer like `2000` selects variant closest to 2000 kbps. |
+| `download.image_quality` | `orig` (default) / `large` / `medium` / `small` | Rewrites pbs.twimg.com URL to request `?name=<value>`. `orig` = native upload (often 2-4× medium size). |
 
 ---
 
